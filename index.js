@@ -30,6 +30,10 @@ export default {
 export class Room {
   constructor(state, env) {
     this.state = state;
+    // Проверку связи (игра шлёт «ping» каждые 20 секунд) Cloudflare
+    // отвечает сам, не будя комнату: спящая комната не тратит время
+    // работы, а без этого пинги не давали бы ей уснуть всю дуэль.
+    this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
 
   async fetch(req) {
@@ -224,3 +228,4 @@ export class Room {
     await this.save(r);
   }
 }
+
