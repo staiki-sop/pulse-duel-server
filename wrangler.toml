@@ -1,6 +1,6 @@
 # Сервер комнат дуэли «Пульса». Выкладка: см. server/README.md.
 name = "pulse-duel"
-main = "src/index.js"
+main = "index.js"
 compatibility_date = "2025-09-01"
 
 [[durable_objects.bindings]]
