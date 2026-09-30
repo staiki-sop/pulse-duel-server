@@ -7,6 +7,15 @@ compatibility_date = "2025-09-01"
 name = "ROOMS"
 class_name = "Room"
 
+[[durable_objects.bindings]]
+name = "REPORTS"
+class_name = "Reports"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Room"]
+
+# Отчёты «чёрного ящика» (вылеты в Телеграме).
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["Reports"]

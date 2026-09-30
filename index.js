@@ -12,9 +12,36 @@
 const AWAY_LIMIT_MS = 90 * 1000;
 const ROOM_TTL_MS = 60 * 60 * 1000;
 
+// Отчёты «чёрного ящика»: игра в Телеграме присылает журнал последних
+// событий, если прошлый сеанс оборвался (вылет) или в нём были ошибки.
+// Хранятся последние REPORTS_MAX; смотреть — /reports?key=… (ключ —
+// секрет REPORTS_KEY в настройках воркера на Cloudflare).
+const REPORT_MAX_BYTES = 40000;
+const REPORTS_MAX = 300;
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
+    if (url.pathname === "/report") {
+      return handleReport(req, env);
+    }
+    if (url.pathname === "/reports") {
+      const key = url.searchParams.get("key") || "";
+      if (!env.REPORTS_KEY || key !== env.REPORTS_KEY) {
+        return new Response("forbidden", { status: 403 });
+      }
+      const stub = env.REPORTS.get(env.REPORTS.idFromName("all"));
+      const q = new URLSearchParams({
+        format: url.searchParams.get("format") || "html",
+        n: url.searchParams.get("n") || "100",
+      });
+      return stub.fetch("https://reports/list?" + q.toString());
+    }
     const m = url.pathname.match(/^\/room\/([0-9A-Z]{4,8})$/);
     if (!m) {
       return new Response("pulse duel", { status: 200 });
@@ -26,6 +53,113 @@ export default {
     return stub.fetch(req);
   },
 };
+
+async function handleReport(req, env) {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: CORS });
+  }
+  if (req.method !== "POST") {
+    return new Response("post only", { status: 405, headers: CORS });
+  }
+  const text = await req.text();
+  if (text.length > REPORT_MAX_BYTES) {
+    return new Response("too big", { status: 413, headers: CORS });
+  }
+  let body;
+  try { body = JSON.parse(text); } catch (e) {
+    return new Response("bad json", { status: 400, headers: CORS });
+  }
+  if (!body || typeof body !== "object") {
+    return new Response("bad json", { status: 400, headers: CORS });
+  }
+  const stub = env.REPORTS.get(env.REPORTS.idFromName("all"));
+  await stub.fetch("https://reports/add", {
+    method: "POST",
+    body: JSON.stringify({ at: Date.now(), body }),
+  });
+  return new Response("ok", { headers: CORS });
+}
+
+// Все отчёты — в одном Durable Object: их мало, и так их проще листать.
+export class Reports {
+  constructor(state) {
+    this.state = state;
+  }
+
+  async fetch(req) {
+    const url = new URL(req.url);
+    const st = this.state.storage;
+    if (url.pathname === "/add") {
+      const r = await req.json();
+      const key = "r:" + String(r.at).padStart(14, "0") + ":" +
+        Math.random().toString(36).slice(2, 8);
+      await st.put(key, r);
+      const keys = [...(await st.list({ prefix: "r:" })).keys()];
+      if (keys.length > REPORTS_MAX) {
+        await st.delete(keys.slice(0, keys.length - REPORTS_MAX));
+      }
+      return new Response("ok");
+    }
+    if (url.pathname === "/list") {
+      const n = Math.max(1, Math.min(REPORTS_MAX, Number(url.searchParams.get("n")) || 100));
+      const rows = [...(await st.list({ prefix: "r:", reverse: true, limit: n })).values()];
+      if (url.searchParams.get("format") === "json") {
+        return new Response(JSON.stringify(rows), {
+          headers: { "Content-Type": "application/json; charset=utf-8" },
+        });
+      }
+      return new Response(reportsHtml(rows), {
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      });
+    }
+    return new Response("not found", { status: 404 });
+  }
+}
+
+function esc(v) {
+  return String(v == null ? "" : v).replace(/[&<>"]/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function msk(t) {
+  try {
+    return new Date(t).toLocaleString("ru-RU", { timeZone: "Europe/Moscow" });
+  } catch (e) {
+    return new Date(t).toISOString();
+  }
+}
+
+// Страница со списком: сверху новые. Вид отчёта — «вылет», если сеанс
+// оборвался без закрытия (с перезапуском — если игру открыли снова
+// через считаные секунды), или «ошибки», если сеанс закрылся сам.
+function reportsHtml(rows) {
+  const items = rows.map((r) => {
+    const b = r.body || {};
+    const s = b.ses || {};
+    const d = s.dev || {};
+    let kind = b.kind === "crash" ? "обрыв" : "ошибки";
+    if (b.kind === "crash" && typeof b.gap === "number" && b.gap < 30) {
+      kind = "вылет, перезапуск через " + b.gap + " с";
+    }
+    const flags = (s.flags || []).join(", ");
+    const ev = (s.ev || []).map((e) =>
+      "<tr><td>" + esc(e[0]) + " с</td><td>" + esc(e[1]) + "</td><td>" + esc(e[2]) +
+      "</td><td>" + (e[3] ? esc(e[3]) + " МБ" : "") + "</td></tr>").join("");
+    return "<section><h2>" + esc(kind) + " · " + esc(msk(r.at)) + "</h2>" +
+      "<p>" + esc(d.ua) + "</p>" +
+      "<p>Телеграм " + esc(d.tg) + " · экран " + esc(d.scr) + " · плотность " + esc(d.dpr) +
+      (d.mem ? " · память устройства " + esc(d.mem) + " ГБ" : "") +
+      " · игрок " + esc(b.id) + " · версия " + esc(b.ver) + "</p>" +
+      (flags ? "<p><b>" + esc(flags) + "</b></p>" : "") +
+      "<p>сеанс длился " + esc(s.dur) + " с</p>" +
+      "<table>" + ev + "</table></section>";
+  }).join("");
+  return "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>" +
+    "<title>Отчёты Пульса</title><style>body{font:14px/1.4 system-ui;margin:16px;background:#141110;color:#eee}" +
+    "section{border-top:1px solid #444;padding:8px 0}h2{font-size:16px;color:#f5b842;margin:4px 0}" +
+    "p{margin:2px 0;color:#bbb}td{padding:1px 8px 1px 0;vertical-align:top}b{color:#f77}</style>" +
+    "<h1>Отчёты: " + rows.length + "</h1>" + (items || "<p>пока пусто</p>");
+}
 
 export class Room {
   constructor(state, env) {
@@ -228,4 +362,3 @@ export class Room {
     await this.save(r);
   }
 }
-
